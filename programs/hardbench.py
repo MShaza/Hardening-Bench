@@ -5,6 +5,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import time
 from pathlib import Path
 
 PROGRAMS_DIR = Path("programs")
+DEMO_DIR = Path("demos")
 BUILD_DIR = Path("build")
 
 CONFIGS = {
@@ -32,16 +34,30 @@ CONFIGS = {
     ],
 }
 
+# Each protection isolated, so we can see which mechanism catches the overflow.
+DEMO_CONFIGS = {
+    "baseline": CONFIGS["baseline"],
+    "canary_only": [
+        "-O2", "-fstack-protector-strong", "-no-pie",
+        "-U_FORTIFY_SOURCE", "-Wl,-z,norelro",
+    ],
+    "fortify_only": [
+        "-O2", "-fno-stack-protector", "-no-pie",
+        "-D_FORTIFY_SOURCE=2", "-Wl,-z,norelro",
+    ],
+    "hardened": CONFIGS["hardened"],
+}
+
 COMPILERS = {
     ".c": ["gcc"],
     ".cpp": ["g++", "-std=c++17"],
 }
 
 
-def build(src: Path, cfg: str, outdir: Path) -> Path:
+def build(src: Path, cfg: str, outdir: Path, configs: dict = CONFIGS) -> Path:
     """Compile one source file with one config. Exit with a clear error on failure."""
     out = outdir / f"{src.stem}.{cfg}"
-    cmd = [*COMPILERS[src.suffix], *CONFIGS[cfg], str(src), "-o", str(out)]
+    cmd = [*COMPILERS[src.suffix], *configs[cfg], str(src), "-o", str(out)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -170,12 +186,56 @@ def pct(new: float, old: float) -> float:
     return (new / old - 1) * 100
 
 
+# ------------------------------------------------------------------- security demo
+
+def describe_exit(rc: int) -> str:
+    """Turn a subprocess return code into something readable."""
+    if rc >= 0:
+        return f"exited normally (code {rc})"
+    return f"killed by {signal.Signals(-rc).name}"
+
+
+def run_demo() -> bool:
+    """Feed a safe and an oversized input to each variant of vuln_demo."""
+    src = DEMO_DIR / "vuln_demo.c"
+    if not src.exists():
+        sys.exit(f"missing {src}")
+    BUILD_DIR.mkdir(exist_ok=True)
+    bins = {cfg: build(src, cfg, BUILD_DIR, DEMO_CONFIGS) for cfg in DEMO_CONFIGS}
+
+    inputs = {"safe input (5 bytes)": "hello", "overflow input (64 bytes)": "A" * 64}
+    ok = True
+    print("\nvuln_demo.c (deliberate strcpy overflow into a 16-byte buffer)")
+
+    for label, arg in inputs.items():
+        print(f"\n  {label}")
+        for cfg, binary in bins.items():
+            r = subprocess.run([str(binary), arg], capture_output=True, text=True)
+            lines = r.stderr.strip().splitlines()
+            msg = f"  | {lines[0]}" if lines else ""
+            print(f"    {cfg:13} {describe_exit(r.returncode)}{msg}")
+
+            # Safe input must behave identically everywhere.
+            if arg == "hello" and r.returncode != 0:
+                ok = False
+            # The fully hardened build must stop the overflow with an abort.
+            if arg == "A" * 64 and cfg == "hardened" and r.returncode != -signal.SIGABRT:
+                ok = False
+
+    print(f"\n  demo check: {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 # ------------------------------------------------------------------------ main
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=int, default=15, help="timed runs per config")
+    parser.add_argument("--demo", action="store_true", help="run only the security demo")
     args = parser.parse_args()
+
+    if args.demo:
+        sys.exit(0 if run_demo() else "demo failed")
 
     sources = find_sources()
     if not sources:
@@ -212,8 +272,9 @@ def main() -> None:
             f"size {size_pct:+.1f}%  ({args.runs} runs, interleaved)"
         )
 
-    if not all_ok:
-        sys.exit("\nFAILED: at least one program behaved differently when hardened")
+    demo_ok = run_demo()
+    if not (all_ok and demo_ok):
+        sys.exit("\nFAILED: see output above")
 
 
 if __name__ == "__main__":
