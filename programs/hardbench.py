@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""hardbench: build every program in programs/ in baseline and hardened configs,
-then inspect each binary to verify which protections are really present."""
+"""hardbench: build programs in baseline and hardened configs, verify the
+protections in the ELF, and compare correctness, runtime and size."""
+import argparse
+import os
 import re
+import shutil
+import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PROGRAMS_DIR = Path("programs")
 BUILD_DIR = Path("build")
 
-# All flags live here so later steps (benchmark, security demo) reuse them.
 CONFIGS = {
     "baseline": [
         "-O2",
@@ -28,7 +32,6 @@ CONFIGS = {
     ],
 }
 
-# Compiler (plus language-specific flags) chosen by source file extension.
 COMPILERS = {
     ".c": ["gcc"],
     ".cpp": ["g++", "-std=c++17"],
@@ -94,7 +97,6 @@ def inspect_binary(binary: Path) -> dict:
     else:
         relro = "none"
 
-    # Imported symbols named __xxx_chk (e.g. __memcpy_chk), excluding the stack canary.
     chk_syms = set(re.findall(r"\b__\w+_chk\b", dynsyms)) - {"__stack_chk_fail"}
 
     return {
@@ -106,23 +108,112 @@ def inspect_binary(binary: Path) -> dict:
     }
 
 
+# ---------------------------------------------------------------- benchmarking
+
+def pin_prefix() -> list[str]:
+    """Pin runs to one CPU core (if taskset exists) to reduce timing noise."""
+    if shutil.which("taskset") is None:
+        return []
+    cpu = max(os.sched_getaffinity(0))
+    return ["taskset", "-c", str(cpu)]
+
+
+def run_once(binary: Path, prefix: list[str]) -> tuple[str, int, float]:
+    """Run a binary once. Return (stdout, exit code, wall time in seconds)."""
+    start = time.perf_counter()
+    result = subprocess.run(
+        [*prefix, str(binary)], capture_output=True, text=True
+    )
+    elapsed = time.perf_counter() - start
+    return result.stdout, result.returncode, elapsed
+
+
+def benchmark_pair(bins: dict[str, Path], runs: int) -> dict:
+    """Run every config's binary `runs` times, interleaved, after one warm-up.
+
+    Interleaving (baseline, hardened, baseline, hardened, ...) means thermal
+    drift and background load affect both configs equally.
+    """
+    prefix = pin_prefix()
+    outputs = {cfg: set() for cfg in bins}
+    times = {cfg: [] for cfg in bins}
+
+    for cfg, b in bins.items():          # warm-up: not timed
+        run_once(b, prefix)
+
+    for _ in range(runs):
+        for cfg, b in bins.items():
+            out, rc, dt = run_once(b, prefix)
+            outputs[cfg].add((out, rc))
+            times[cfg].append(dt)
+
+    return {"outputs": outputs, "times": times}
+
+
+def check_correctness(outputs: dict) -> tuple[bool, str]:
+    """All runs of all configs must give the same stdout and exit code 0."""
+    all_results = set().union(*outputs.values())
+    if len(all_results) != 1:
+        return False, f"outputs differ: {sorted(all_results)}"
+    (out, rc), = all_results
+    if rc != 0:
+        return False, f"non-zero exit code {rc}"
+    return True, "identical output, exit code 0"
+
+
+def median_and_stdev(values: list[float]) -> tuple[float, float]:
+    sd = statistics.stdev(values) if len(values) > 1 else 0.0
+    return statistics.median(values), sd
+
+
+def pct(new: float, old: float) -> float:
+    return (new / old - 1) * 100
+
+
+# ------------------------------------------------------------------------ main
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runs", type=int, default=15, help="timed runs per config")
+    args = parser.parse_args()
+
     sources = find_sources()
     if not sources:
         sys.exit(f"no .c or .cpp files found in {PROGRAMS_DIR}/")
 
     BUILD_DIR.mkdir(exist_ok=True)
+    all_ok = True
 
     for src in sources:
         print(f"\n{src.name}")
+        bins = {cfg: build(src, cfg, BUILD_DIR) for cfg in CONFIGS}
+        info = {cfg: inspect_binary(b) for cfg, b in bins.items()}
+
         for cfg in CONFIGS:
-            out = build(src, cfg, BUILD_DIR)
-            info = inspect_binary(out)
+            i = info[cfg]
             print(
-                f"  {cfg:9} pie={info['pie']!s:5} canary={info['canary']!s:5} "
-                f"relro={info['relro']:7} fortify={info['fortify']!s:5} "
-                f"size={info['size_bytes']}"
+                f"  {cfg:9} pie={i['pie']!s:5} canary={i['canary']!s:5} "
+                f"relro={i['relro']:7} fortify={i['fortify']!s:5} "
+                f"size={i['size_bytes']}"
             )
+
+        result = benchmark_pair(bins, args.runs)
+        ok, msg = check_correctness(result["outputs"])
+        all_ok &= ok
+        print(f"  correctness: {'OK' if ok else 'FAIL'} ({msg})")
+
+        base_med, base_sd = median_and_stdev(result["times"]["baseline"])
+        hard_med, hard_sd = median_and_stdev(result["times"]["hardened"])
+        size_pct = pct(info["hardened"]["size_bytes"], info["baseline"]["size_bytes"])
+        print(f"  baseline  median {base_med:.3f}s  stdev {base_sd:.3f}s")
+        print(f"  hardened  median {hard_med:.3f}s  stdev {hard_sd:.3f}s")
+        print(
+            f"  overhead: time {pct(hard_med, base_med):+.1f}%  "
+            f"size {size_pct:+.1f}%  ({args.runs} runs, interleaved)"
+        )
+
+    if not all_ok:
+        sys.exit("\nFAILED: at least one program behaved differently when hardened")
 
 
 if __name__ == "__main__":
